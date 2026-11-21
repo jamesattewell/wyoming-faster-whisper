@@ -10,6 +10,13 @@ template's system turn to bias decoding toward specific spellings, so
 ``--initial-prompt`` can carry Home Assistant entity names ("Vocabulary: Ecobee,
 office lamp.") and fix names that would otherwise be transcribed phonetically.
 
+The catch is that the model has no "no speech" output. On audio it cannot read,
+such as a TV or people talking in the next room (which VAD lets through), it
+copies the biasing context out as the transcript, so the user's entity list
+would go to the intent pipeline as if they had said it. Decoding stops as soon
+as the output starts reading the names back, and the transcript is "" (see
+_ECHO_MIN_NAMES).
+
 Two decoder layouts are supported, chosen by which files the model directory has:
 
 *merged* (``decoder_merged.int4.onnx``) - one graph taking a KV cache *and* a
@@ -36,7 +43,7 @@ import logging
 import threading
 import wave
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnxruntime as ort
@@ -74,6 +81,14 @@ _ASR_TEXT = 151704  # <asr_text>: everything before it is the language preamble
 _EOS_IDS = frozenset((151643, 151645))
 
 _MAX_NEW_TOKENS = 256
+
+# Echo guard. A real command mentions a name or two from the biasing list; an
+# echo reads the list out in order. So a transcript containing this many
+# consecutive names from the prompt is treated as an echo. Both sides are
+# normalized first (see _normalize): the 1.7B model echoes with its own casing
+# and spacing ("office, study, up stairs, ..."), so matching tokens is too literal.
+_ECHO_MIN_NAMES = 3
+_SEPARATORS = ",\uff0c\u3001"  # vocabulary.py joins names with ", "; also "，" "、"
 
 # Most draft tokens checked in one decoder step after the decode has left the
 # draft and found it again. A step is bound by reading the weights, so checking
@@ -184,6 +199,30 @@ def _system_ids(context_ids: Sequence[int]) -> List[int]:
     return [_IM_START, _SYSTEM, _NEWLINE, *context_ids, _IM_END, _NEWLINE]
 
 
+def _normalize(text: str) -> str:
+    """Lowercase letters and digits, with every separator as "," and nothing else.
+
+    "Up stairs" and "Upstairs" both become "upstairs", so differences in casing,
+    spacing and punctuation do not hide an echo.
+    """
+    return "".join(
+        "," if char in _SEPARATORS else char
+        for char in text.lower()
+        if char.isalnum() or char in _SEPARATORS
+    )
+
+
+def _echo_patterns(prompt: Optional[str]) -> FrozenSet[str]:
+    """Normalized runs of the prompt's names that a transcript must not contain."""
+    names = [name for name in _normalize(prompt or "").split(",") if name]
+    n = _ECHO_MIN_NAMES
+    if len(names) < n:
+        # Too few names for a run: the whole list, if it is a list at all.
+        return frozenset([",".join(names)]) if len(names) > 1 else frozenset()
+
+    return frozenset(",".join(names[i : i + n]) for i in range(len(names) - n + 1))
+
+
 def _accept_draft(logits: np.ndarray, draft: Sequence[int]) -> List[int]:
     """Greedy tokens implied by one prefill over a draft, as far as it holds.
 
@@ -235,7 +274,8 @@ def _continue_greedy(
     past_values: np.ndarray,
     step,
     multi_token_steps: bool,
-) -> List[int]:
+    is_echo: Optional[Callable[[List[int]], bool]] = None,
+) -> Optional[List[int]]:
     """Finish a greedy decode from a prefill that also ran ``draft``.
 
     ``logits`` holds the prefill's rows from the last prompt position on, and the
@@ -247,6 +287,10 @@ def _continue_greedy(
     With ``multi_token_steps`` (the merged decoder; the split one's step graph
     takes a single token), each step after a mismatch also checks where the
     draft resumes, so one differing word does not cost the rest of the draft.
+
+    Returns None, without finishing, as soon as ``is_echo`` says the tokens so
+    far are reading the biasing prompt back: reading out the rest of a long
+    prompt would only waste time.
     """
     tokens = _accept_draft(logits, draft)
     accepted = len(tokens) - 1
@@ -258,7 +302,14 @@ def _continue_greedy(
         past_values = np.ascontiguousarray(past_values[:, :, :, :position])
 
     cursor = accepted
-    while (tokens[-1] not in _EOS_IDS) and (len(tokens) < _MAX_NEW_TOKENS):
+    while True:
+        # Checked after every step, which may have accepted several draft tokens.
+        if (is_echo is not None) and is_echo(tokens):
+            return None
+
+        if (tokens[-1] in _EOS_IDS) or (len(tokens) >= _MAX_NEW_TOKENS):
+            break
+
         guess: List[int] = []
         start = cursor
         if multi_token_steps and draft:
@@ -512,8 +563,13 @@ class Qwen3AsrTranscriber(Transcriber):
         n_system: int,
         draft: Sequence[int],
         run_options: Optional[ort.RunOptions] = None,
-    ) -> List[int]:
-        """Greedy decode reusing the system turn's KV across utterances."""
+        is_echo: Optional[Callable[[List[int]], bool]] = None,
+    ) -> Optional[List[int]]:
+        """Greedy decode reusing the system turn's KV across utterances.
+
+        Returns None on an echo (see _continue_greedy). The prefix cache is left
+        as it is, so the next utterance still reuses the prompt's KV.
+        """
         past_keys, past_values = self._prefix_cache(prompt_ids[:n_system], run_options)
 
         # Everything after the system turn: the audio placeholders, the
@@ -553,6 +609,7 @@ class Qwen3AsrTranscriber(Transcriber):
             past_values,
             step,
             multi_token_steps=True,
+            is_echo=is_echo,
         )
 
     def _generate(
@@ -561,8 +618,12 @@ class Qwen3AsrTranscriber(Transcriber):
         prompt_ids: List[int],
         draft: Sequence[int],
         run_options: Optional[ort.RunOptions] = None,
-    ) -> List[int]:
-        """Greedy decode on the split layout: prefill, then one token at a time."""
+        is_echo: Optional[Callable[[List[int]], bool]] = None,
+    ) -> Optional[List[int]]:
+        """Greedy decode on the split layout: prefill, then one token at a time.
+
+        Returns None on an echo (see _continue_greedy).
+        """
         assert (self._decoder_init is not None) and (self._decoder_step is not None)
         decoder_step = self._decoder_step
         input_ids = prompt_ids + list(draft)
@@ -607,7 +668,16 @@ class Qwen3AsrTranscriber(Transcriber):
             past_values,
             step,
             multi_token_steps=False,
+            is_echo=is_echo,
         )
+
+    def _is_echo(self, tokens: List[int], echo_patterns: FrozenSet[str]) -> bool:
+        """Whether the transcript so far reads out a run of the prompt's names."""
+        if _ASR_TEXT in tokens:
+            tokens = tokens[tokens.index(_ASR_TEXT) + 1 :]
+
+        text = _normalize(self._tokenizer.decode(tokens, skip_special_tokens=True))
+        return ("," in text) and any(pattern in text for pattern in echo_patterns)
 
     def decode_tokens(
         self,
@@ -616,10 +686,13 @@ class Qwen3AsrTranscriber(Transcriber):
         initial_prompt: Optional[str] = None,
         draft: Sequence[int] = (),
         run_options: Optional[ort.RunOptions] = None,
-    ) -> List[int]:
+    ) -> Optional[List[int]]:
         """Greedy-decode float32 16kHz ``audio`` into the model's raw tokens.
 
-        The result is the whole assistant turn, detected-language preamble too.
+        The result is the whole assistant turn, detected-language preamble too,
+        or None if the output started reading ``initial_prompt`` back (the model
+        has no "no speech" output, so that is what it does with audio it cannot
+        read, such as speech-like noise that got past VAD).
         ``draft`` is a guess at it (such as an earlier decode of most of the same
         audio). It does not change the result, only how fast it arrives: the
         draft is checked in the same single pass that reads the prompt, every
@@ -645,25 +718,46 @@ class Qwen3AsrTranscriber(Transcriber):
         )
         draft = list(draft)[:_MAX_NEW_TOKENS]
 
+        echo_patterns = _echo_patterns(initial_prompt)
+        is_echo = (
+            (lambda tokens: self._is_echo(tokens, echo_patterns))
+            if echo_patterns
+            else None
+        )
+
         if self._merged is not None:
-            return self._generate_merged(
+            tokens = self._generate_merged(
                 audio_features,
                 prompt_ids,
                 len(_system_ids(context_ids)),
                 draft,
                 run_options,
+                is_echo=is_echo,
+            )
+        else:
+            # No draft on the split layout. It would be checked in decoder_init
+            # but generated in decoder_step, two graphs that round differently,
+            # so there a draft tipped near-ties far more often than on the
+            # merged layout: 13 of 260 test decodes, one of them with a draft
+            # identical to the result. The split layout also gets none of the
+            # multi-token steps that make drafts pay off.
+            tokens = self._generate(
+                audio_features, prompt_ids, (), run_options, is_echo=is_echo
             )
 
-        # No draft on the split layout. It would be checked in decoder_init but
-        # generated in decoder_step, two graphs that round differently, so there
-        # a draft tipped near-ties far more often than on the merged layout: 13
-        # of 260 test decodes, one of them with a draft identical to the
-        # result. The split layout also gets none of the multi-token steps that
-        # make drafts pay off.
-        return self._generate(audio_features, prompt_ids, (), run_options)
+        if tokens is None:
+            _LOGGER.debug("Transcript was echoing the biasing prompt; dropping it")
 
-    def tokens_to_text(self, tokens: Sequence[int]) -> str:
-        """Turn the assistant turn into the transcript."""
+        return tokens
+
+    def tokens_to_text(self, tokens: Optional[Sequence[int]]) -> str:
+        """Turn the assistant turn into the transcript.
+
+        None, a decode that was echoing the biasing prompt, gives "".
+        """
+        if tokens is None:
+            return ""
+
         tokens = list(tokens)
 
         # The model writes the detected language before <asr_text>; drop it.
@@ -683,7 +777,8 @@ class Qwen3AsrTranscriber(Transcriber):
 
         WAV file must be 16Khz 16-bit mono audio. Decoding is greedy, so
         beam_size is ignored. initial_prompt is used as biasing context rather
-        than as a transcript prefix.
+        than as a transcript prefix. If the output starts copying it, "" is
+        returned instead (see decode_tokens).
         """
         wav_file: wave.Wave_read = wave.open(str(wav_path), "rb")
         with wav_file:
@@ -799,8 +894,9 @@ class Qwen3AsrStreamingSession(StreamingSession):
         self._audio = bytearray()
         self._leftover = b""
         self._decoded_bytes = 0  # audio covered by the last pass started
-        # The audio and tokens of the last pass to finish.
-        self._result: Tuple[bytes, List[int]] = (b"", [])
+        # The audio and tokens of the last pass to finish (None: it was echoing
+        # the biasing prompt).
+        self._result: Tuple[bytes, Optional[List[int]]] = (b"", [])
         self._lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None
         self._worker_audio = b""  # what the worker is decoding
@@ -862,9 +958,13 @@ class Qwen3AsrStreamingSession(StreamingSession):
         self._worker_audio = b""
 
     def _draft(self) -> List[int]:
-        """The last finished pass's tokens, as a draft for the next one."""
+        """The last finished pass's tokens, as a draft for the next one.
+
+        A pass that was echoing the prompt gives no draft: it was stopped part
+        way, and the echo is not something the next pass should be steered to.
+        """
         with self._lock:
-            return list(self._result[1])
+            return list(self._result[1] or [])
 
     def _run_pass(
         self, audio_bytes: bytes, run_options: "ort.RunOptions", final: bool
@@ -898,7 +998,11 @@ class Qwen3AsrStreamingSession(StreamingSession):
             "%s transcript (%.2fs): %s",
             "Speech-end" if final else "Partial",
             len(audio_bytes) / (2 * _RATE),
-            self.model.tokens_to_text(tokens),
+            (
+                "(echo of the biasing prompt)"
+                if tokens is None
+                else self.model.tokens_to_text(tokens)
+            ),
         )
 
     def finish(self) -> str:

@@ -271,7 +271,7 @@ def test_split_layout_decodes_without_the_draft(
     monkeypatch.setattr(model, "_build_prompt_ids", lambda *args: [1, 2, 3])
     drafts = []
 
-    def generate(features, prompt_ids, draft, run_options=None):
+    def generate(features, prompt_ids, draft, run_options=None, is_echo=None):
         drafts.append(list(draft))
         return [7]
 
@@ -502,7 +502,7 @@ class _PrefillRecorder:
         return _build_prompt_ids(None, n_audio_tokens, context_ids, language_ids)
 
     def _generate_merged(
-        self, audio_features, prompt_ids, n_system, draft, run_options
+        self, audio_features, prompt_ids, n_system, draft, run_options, is_echo=None
     ):
         self.calls.append((prompt_ids, draft))
         return list(self.generated)
